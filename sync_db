@@ -1,0 +1,343 @@
+#!/bin/bash
+cd "$(pwd)"
+
+check_dependencies() {
+    local missing_deps=0
+    local install_list=""
+
+    # Check for netcat
+    command -v nc >/dev/null 2>&1 || { echo >&2 "netcat is required but it's not installed."; missing_deps=1; install_list="$install_list nc"; }
+
+    # Check for sshpass
+    command -v sshpass >/dev/null 2>&1 || { echo >&2 "sshpass is required but it's not installed."; missing_deps=1; install_list="$install_list sshpass"; }
+
+    # Check for knock only if KNOCK is true
+    if [ "$KNOCK" = true ]; then
+        command -v knock >/dev/null 2>&1 || { echo >&2 "knock is optional but not installed. Some features may be unavailable."; missing_deps=1; install_list="$install_list knock"; }
+    fi
+    
+    # If dependencies are missing, attempt to install them
+    if [ $missing_deps -ne 0 ]; then
+        echo "Missing dependencies: $install_list"
+        echo "Do you want to install the missing packages? [y/N]"
+        read -r response
+        if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+            if command -v apt-get >/dev/null; then
+                sudo apt-get update && sudo apt-get install -y $install_list
+            elif command -v yum >/dev/null; then
+                sudo yum install -y $install_list
+            elif command -v zypper >/dev/null; then
+                sudo zypper install -y $install_list
+            else
+                echo "Automatic installation not supported on this system. Please install the missing packages manually."
+                exit 1
+            fi
+        else
+            echo "User declined installation. Exiting..."
+            exit 1
+        fi
+    fi
+}
+check_dependencies
+
+# Variables
+#!/bin/bash
+
+CONFIG_FILE=".sync_db.conf"
+
+# Function to create configuration file if it doesn't exist
+create_config_file() {
+    echo "Creating configuration file: $CONFIG_FILE"
+    echo -n "Enter REMOTE_USER [default: root]: "
+    read -r input
+    REMOTE_USER=${input:-root}
+
+    echo -n "Enter REMOTE_HOST [example: example.com]: "
+    read -r REMOTE_HOST
+
+    echo -n "Enter REMOTE_PORT [default: 22]: "
+    read -r input
+    REMOTE_PORT=${input:-5555}
+
+    echo -n "Enter REMOTE_DB_CONTAINER [example: proyect-db-1]: "
+    read -r REMOTE_DB_CONTAINER
+
+    echo -n "Enter REMOTE_DB_NAME [example: dbProyect]: "
+    read -r REMOTE_DB_NAME
+
+    echo -n "Enter REMOTE_DB_USER [default: root]: "
+    read -r input
+    REMOTE_DB_USER=${input:-root}
+
+    echo -n "Enter REMOTE_DB_PASSWORD: "
+    read -r -s REMOTE_DB_PASSWORD
+    echo
+
+    echo -n "Enter LOCAL_DB_CONTAINER [default: ${REMOTE_DB_NAME} ]: "
+    read -r input
+    LOCAL_DB_CONTAINER=${input:-$REMOTE_DB_NAME}
+    echo
+
+    echo -n "Enter LOCAL_DB_NAME [default: ${REMOTE_DB_CONTAINER}]: "
+    read -r input
+    LOCAL_DB_NAME=${input:-$REMOTE_DB_CONTAINER}
+    echo
+
+    echo -n "Enter LOCAL_DB_USER [default: root]: "
+    read -r input
+    LOCAL_DB_USER=${input:-root}
+    echo
+
+    echo -n "Enter LOCAL_DB_PASSWORD: [default: REMOTE_DB_PASSWORD]"
+    read -r -s input
+    LOCAL_DB_PASSWORD=${input:-$REMOTE_DB_PASSWORD}
+    echo
+
+    echo -n "Use KNOCK feature? [y/N]: "
+    read -r input
+    KNOCK=${input:-N}
+    KNOCK=${KNOCK,,}  # convert to lowercase
+    if [[ $KNOCK == "y" ]]; then
+        KNOCK=true
+        echo -n "Enter KNOCK_PORTS (comma-separated, example: 58,5,505,52,5): "
+        read -r KNOCK_PORTS
+    else
+        KNOCK=false
+        KNOCK_PORTS=""
+    fi
+
+    {
+        echo "REMOTE_USER=\"$REMOTE_USER\""
+        echo "REMOTE_HOST=\"$REMOTE_HOST\""
+        echo "REMOTE_PORT=\"$REMOTE_PORT\""
+        echo "REMOTE_DB_CONTAINER=\"$REMOTE_DB_CONTAINER\""
+        echo "REMOTE_DB_NAME=\"$REMOTE_DB_NAME\""
+        echo "REMOTE_DB_USER=\"$REMOTE_DB_USER\""
+        echo "REMOTE_DB_PASSWORD=\"$REMOTE_DB_PASSWORD\""
+        echo "LOCAL_DB_CONTAINER=\"$LOCAL_DB_CONTAINER\""
+        echo "LOCAL_DB_NAME=\"$LOCAL_DB_NAME\""
+        echo "LOCAL_DB_USER=\"$LOCAL_DB_USER\""
+        echo "LOCAL_DB_PASSWORD=\"$LOCAL_DB_PASSWORD\""
+        echo "KNOCK=$KNOCK"
+        echo "KNOCK_PORTS=\"$KNOCK_PORTS\""
+    } > "$CONFIG_FILE"
+}
+
+# Check if the configuration file exists, if not, create it
+if [ ! -f "$CONFIG_FILE" ]; then
+    create_config_file
+else
+    echo "Configuration file '$CONFIG_FILE' already exists."
+    source "$CONFIG_FILE"
+fi
+
+BACKUP_FILE="/tmp/${LOCAL_DB_NAME}.sql"
+TEMP_DB_NAME="sync_${LOCAL_DB_NAME}"
+TEMP_DB_NAME_2="sync_backup${LOCAL_DB_NAME}"
+KNOWN_HOSTS_FILE="$HOME/.ssh/known_hosts"
+
+# Request SSH password for SSH and SCP operations
+read -sp "Enter SSH password for user ${REMOTE_USER} at host ${REMOTE_HOST}: " SSH_PASSWORD
+echo
+
+# Function to execute commands and capture errors
+execute_and_capture() {
+  local command="$1"
+  local fail_message="$2"
+  
+  # Execute the command and capture both stdout and stderr
+  local output=$(eval "$command" 2>&1)
+  local status=$?
+  
+  # Check the exit code returned by the last executed command
+  if [ $status -ne 0 ]; then
+    echo "Error: $fail_message"
+    echo "Error details: $output"
+    cleanup
+    exit 1
+  fi
+}
+
+# Cleanup function
+# Cleanup function
+cleanup() {
+    echo "Initiating cleanup process..."
+    local errors_occurred=0
+    
+    # Check and remove the backup file from the local system
+    if [ -f "$BACKUP_FILE" ]; then
+        echo "Removing local backup file: $BACKUP_FILE"
+        rm -f "$BACKUP_FILE"
+        if [ $? -ne 0 ]; then
+            echo "Failed to remove local backup file."
+            errors_occurred=1
+        fi
+    else
+        echo "No local backup file to remove."
+    fi
+    
+    # Attempt to remove the backup file from the Docker container
+    echo "Removing backup file from Docker container: $BACKUP_FILE"
+    local docker_output=$(docker exec "$LOCAL_DB_CONTAINER" rm -f "$BACKUP_FILE" 2>&1)
+    if [ $? -ne 0 ]; then
+        echo "Failed to remove backup file from Docker container: $docker_output"
+        errors_occurred=1
+    else
+        echo "Backup file successfully removed from Docker container."
+    fi
+
+    # Report any errors occurred during the cleanup
+    if [ $errors_occurred -ne 0 ]; then
+        echo "Errors occurred during cleanup. Please check the logs."
+        return 1
+    else
+        echo "Cleanup completed successfully."
+        return 0
+    fi
+}
+
+# Function to check if the SSH port is open and attempt to open it using port knocking if necessary.
+check_ssh_port() {
+    echo "Checking if SSH port $REMOTE_PORT is open..."
+    nc -z -w5 $REMOTE_HOST $REMOTE_PORT
+
+    if [ $? -ne 0 ]; then
+        # If the KNOCK variable is true, proceed with knocking sequence
+        if [ "$KNOCK" = true ]; then
+            # Convert the KNOCK_PORTS string from the configuration into an array
+            KNOCK_PORTS=(${KNOCK_PORTS//,/ })
+
+            echo "SSH port $REMOTE_PORT is closed. Invoking knock to open the port..."
+            for PORT in "${KNOCK_PORTS[@]}"; do
+                # Utilize execute_and_capture to handle the knock command
+                execute_and_capture "knock -v $REMOTE_HOST $PORT" "Failed to knock on port $PORT"
+                sleep 0.3
+            done
+
+            # Wait for 3 seconds to give some time for the port to be opened
+            sleep 3
+
+            # Check again if the port is open
+            nc -z -w5 $REMOTE_HOST $REMOTE_PORT
+            if [ $? -ne 0 ]; then
+                echo "SSH port $REMOTE_PORT is still closed. Unable to continue. Exiting..."
+                exit 1
+            else
+                echo "SSH port $REMOTE_PORT is now open."
+            fi
+        else
+            echo "SSH port $REMOTE_PORT is closed. Unable to continue. Exiting..."
+            exit 1
+        fi
+    else
+        echo "SSH port $REMOTE_PORT is open."
+    fi
+}
+
+
+# Check if the port is open
+check_ssh_port
+
+
+# Check SSH password
+echo "Verifying SSH password..."
+sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=yes -p $REMOTE_PORT $REMOTE_USER@$REMOTE_HOST "exit"
+SSH_EXIT_CODE=$?
+
+if [ $SSH_EXIT_CODE -ne 0 ]; then
+  case $SSH_EXIT_CODE in
+    5) echo "Error: Incorrect SSH password or authentication not allowed." ;;
+    *) echo "Error: Unknown failure in SSH authentication. Exit code: $SSH_EXIT_CODE" ;;
+  esac
+  exit 1
+fi
+
+echo "Step 1: Creating a backup of the remote database..."
+execute_and_capture "sshpass -p '$SSH_PASSWORD' ssh -o StrictHostKeyChecking=yes -tt -p $REMOTE_PORT $REMOTE_USER@$REMOTE_HOST 'docker exec $REMOTE_DB_CONTAINER mariadb-dump -u$REMOTE_DB_USER -p$REMOTE_DB_PASSWORD $REMOTE_DB_NAME > $BACKUP_FILE && exit'" \
+                    "Failed to backup the remote database."
+
+echo "Step 2: Downloading the backup file..."
+execute_and_capture "sshpass -p '$SSH_PASSWORD' scp -o StrictHostKeyChecking=yes -P $REMOTE_PORT $REMOTE_USER@$REMOTE_HOST:$BACKUP_FILE $BACKUP_FILE" \
+                    "Failed to download the backup file."
+
+# Verify that the backup file exists
+if [ ! -f $BACKUP_FILE ]; then
+  echo "Error: The backup file was not downloaded correctly."
+  cleanup
+  exit 1
+fi
+
+echo "Step 3: Checking the loading of the backup file into a temporary database..."
+execute_and_capture "docker exec $LOCAL_DB_CONTAINER mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD -e 'DROP DATABASE IF EXISTS $TEMP_DB_NAME; CREATE DATABASE $TEMP_DB_NAME;'" \
+                    "Failed to create temporary database."
+
+execute_and_capture "docker cp $BACKUP_FILE $LOCAL_DB_CONTAINER:$BACKUP_FILE" \
+                    "Failed to copy the backup file to the local container."
+
+execute_and_capture "docker exec -i $LOCAL_DB_CONTAINER sh -c 'mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD $TEMP_DB_NAME < $BACKUP_FILE'" \
+                    "Failed to load the backup file into the temporary database."
+read -sp "Press any key to continue..."
+echo "Step 4: Deleting existing tables and moving tables from the temporary database..."
+echo "Creating backup database..."
+execute_and_capture "docker exec $LOCAL_DB_CONTAINER mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD -e 'CREATE DATABASE IF NOT EXISTS $TEMP_DB_NAME_2;'" \
+                    "Failed to create backup database."
+
+echo "Moving existing tables to the backup database..."
+tables=$(docker exec $LOCAL_DB_CONTAINER mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD -e "SHOW TABLES;" $LOCAL_DB_NAME | grep -v "Tables_in")
+for table in $tables; do
+  execute_and_capture "docker exec $LOCAL_DB_CONTAINER mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD -e 'RENAME TABLE $LOCAL_DB_NAME.$table TO $TEMP_DB_NAME_2.$table;'" \
+                      "Failed to move table $table to the backup database."
+done
+
+echo "Deleting the original database..."
+execute_and_capture "docker exec $LOCAL_DB_CONTAINER mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD -e 'DROP DATABASE IF EXISTS $LOCAL_DB_NAME;'" \
+                    "Failed to delete the original database."
+
+echo "Creating the new database..."
+execute_and_capture "docker exec $LOCAL_DB_CONTAINER mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD -e 'CREATE DATABASE $LOCAL_DB_NAME;'" \
+                    "Failed to create the new database."
+
+echo "Moving tables from the temporary database to the new database..."
+# This block assumes you have already loaded the tables in $TEMP_DB_NAME as before.
+tables=$(docker exec $LOCAL_DB_CONTAINER mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD -e "SHOW TABLES;" $TEMP_DB_NAME | grep -v "Tables_in")
+for table in $tables; do
+  execute_and_capture "docker exec $LOCAL_DB_CONTAINER mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD -e 'RENAME TABLE $TEMP_DB_NAME.$table TO $LOCAL_DB_NAME.$table;'" \
+                      "Failed to move table $table to the new main database."
+done
+
+echo "Verifying that everything is correct before deleting the backup database..."
+
+original_table_count=$(docker exec $LOCAL_DB_CONTAINER mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD -e "SHOW TABLES IN $TEMP_DB_NAME_2;" | grep -v "Tables_in" | wc -l)
+new_table_count=$(docker exec $LOCAL_DB_CONTAINER mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD -e "SHOW TABLES IN $LOCAL_DB_NAME;" | grep -v "Tables_in" | wc -l)
+
+# Compare the counts
+if [ "$original_table_count" -ne "$new_table_count" ]; then
+  echo "Reverting changes due to discrepancy in table counts..."
+  tables=$(docker exec $LOCAL_DB_CONTAINER mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD -e "SHOW TABLES;" $TEMP_DB_NAME_2 | grep -v "Tables_in")
+  for table in $tables; do
+    execute_and_capture "docker exec $LOCAL_DB_CONTAINER mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD -e 'RENAME TABLE $TEMP_DB_NAME_2.$table TO $LOCAL_DB_NAME.$table;'"\
+                        "Failed to move table $table to the main database. Data integrity may have been compromised."
+  done
+  echo "Reversion completed. The database has been restored to its previous state."
+else
+  echo "The table count is consistent. Proceeding to clean up the backup database."
+  execute_and_capture "docker exec $LOCAL_DB_CONTAINER mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD -e 'DROP DATABASE IF EXISTS $TEMP_DB_NAME_2;'" \
+                      "Failed to delete the backup database."
+fi
+
+echo "If everything is correct, proceed to delete the backup database..."
+execute_and_capture "docker exec $LOCAL_DB_CONTAINER mariadb -u$LOCAL_DB_USER -p$LOCAL_DB_PASSWORD -e 'DROP DATABASE IF EXISTS $TEMP_DB_NAME_2;'" \
+                    "Failed to delete the backup database."
+
+echo "Process completed successfully."
+
+echo "Step 5: Cleaning up the downloaded backup file..."
+cleanup
+
+echo "End of the database synchronization process."
+echo "The database has been synchronized successfully."
+
+
+
+
+
