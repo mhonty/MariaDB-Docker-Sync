@@ -4,14 +4,14 @@
 #
 # Usage:
 #   bash install.sh
-#   bash install.sh --uninstall
+#   bash install.sh --uninstall | --remove
 #   bash install.sh -h | --help
 #   bash install.sh -v | --version
 #
 # Options:
-#   --uninstall     Uninstalls the sync_db script and its configuration
-#   -h, --help      Show this help message and exit
-#   -v, --version   Show the installer version and exit
+#   --uninstall, --remove   Uninstalls the sync_db script and its configuration
+#   -h, --help              Show this help message and exit
+#   -v, --version           Show the installer version and exit
 #
 # Exit codes:
 #   0   - Successful installation or uninstallation
@@ -66,35 +66,68 @@ check_dependencies() {
 # Clone the repository
 clone_repository() {
     log_message "Cloning repository..."
-    if [ -d "$TEMP_DIR" ]; then
-        rm -rf "$TEMP_DIR"
+    if [ -d $TEMP_DIR ]; then
+        rm -rf $TEMP_DIR
     fi
 
-    if ! git clone "$REPO_URL" "$TEMP_DIR" >/dev/null 2>&1; then
+    if ! git clone $REPO_URL $TEMP_DIR >/dev/null 2>&1; then
         log_message "Error cloning repository. Aborting installation."
         cleanup
         exit 1
     fi
 
-    # Set executable permissions for the script
+    # Iniciar el contador y esperar hasta que el directorio esté disponible o se alcancen los 10 segundos
+    local wait_time=0
+    while [ ! -d $TEMP_DIR/bin ]; do
+        sleep 1
+        wait_time=$((wait_time + 1))
+        if [ "$wait_time" -ge 10 ]; then
+            log_message "Timeout reached while waiting for the bin directory to appear. Aborting installation."
+            cleanup
+            exit 1
+        fi
+    done
+
     log_message "Setting executable permissions for $SCRIPT_NAME..."
-    chmod +x "$TEMP_DIR/bin/*";   
+    chmod +x $TEMP_DIR/bin/*
+    if ! mkdir -p $INSTALL_DIR/$SCRIPT_NAME; then
+        log_message "Error creating installation directory. Aborting installation."
+        cleanup
+        exit 1
+    fi
+    if ! mv $TEMP_DIR/* $INSTALL_DIR/$SCRIPT_NAME/; then
+        log_message "Error moving scripts to $INSTALL_DIR. Aborting installation."
+        cleanup
+        exit 1
+    fi
+    if ! ln $INSTALL_DIR/$SCRIPT_NAME/bin/sync_db $INSTALL_DIR/sync_db; then
+    log_message "Error creating hard link for sync_db. Aborting installation."
+    cleanup
+    exit 1
+    fi
+    if ! ln $INSTALL_DIR/$SCRIPT_NAME/bin/uninstall_sync_db $INSTALL_DIR/uninstall_sync_db; then
+    log_message "Error creating hard link for sync_db. Aborting installation."
+    cleanup
+    exit 1
+    fi
 }
+
 # Helper function to log messages
 log_message() {
-    if [ ! -z "$LOG_DIR" ] && [ ! -d "$LOG_DIR" ]; then
-        mkdir -p "$LOG_DIR"
-        echo "$(date +'%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+    if [ ! -z $LOG_DIR ] && [ ! -d $LOG_DIR ]; then
+        mkdir -p $LOG_DIR
+        echo $(date +'%Y-%m-%d %H:%M:%S') - $1 | tee -a $LOG_FILE
     elif [ -d "$LOG_DIR" ]; then
-        echo "$(date +'%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+        echo $(date +'%Y-%m-%d %H:%M:%S') - $1 | tee -a $LOG_FILE
     fi
 
 }
 # Cleanup function to remove partial installations
 cleanup() {
+    exit 1;
     log_message "Performing cleanup..."
-    [ -d "$TEMP_DIR" ] && rm -rf "$TEMP_DIR"
-    [ -f "$INSTALL_DIR/$SCRIPT_NAME" ] && rm -f "$INSTALL_DIR/$SCRIPT_NAME"
+    [ -d $TEMP_DIR ] && rm -rf $TEMP_DIR
+    [ -f $INSTALL_DIR/$SCRIPT_NAME ] && rm -f $INSTALL_DIR/$SCRIPT_NAME
     log_message "Cleanup completed."
 }
 # Uninstall function to remove installed files
@@ -102,8 +135,8 @@ uninstall() {
     display_header_uninstall  # Display an uninstallation header, assuming the function is defined
 
     # Check for the script's installation locations and prompt the user if both are present.
-    local local_location="${LOCAL_INSTALL_DIR}/bin/${SCRIPT_NAME}"
-    local global_location="${GLOBAL_INSTALL_DIR}/bin/${SCRIPT_NAME}"
+    local local_location="${LOCAL_INSTALL_DIR}/${SCRIPT_NAME}/bin/${SCRIPT_NAME}"
+    local global_location="${GLOBAL_INSTALL_DIR}/${SCRIPT_NAME}/bin/${SCRIPT_NAME}"
     local choice
 
     if [ -f "$local_location" ] && [ -f "$global_location" ]; then
@@ -118,6 +151,7 @@ uninstall() {
                     location="$local_location"
                     config_dir="$LOCAL_CONFIG_DIR"
                     log_dir="$LOG_DIR"
+                    INSTALL_DIR="$LOCAL_INSTALL_DIR"
                     use_sudo=false
                     break
                     ;;
@@ -125,6 +159,7 @@ uninstall() {
                     location="$global_location"
                     config_dir="$GLOBAL_CONFIG_DIR"
                     log_dir="$GLOBAL_LOG_DIR"
+                    INSTALL_DIR="$GLOBAL_INSTALL_DIR"
                     use_sudo=true
                     break
                     ;;
@@ -139,8 +174,10 @@ uninstall() {
         done
     elif [ -f "$local_location" ]; then
         location="$local_location"; config_dir="$LOCAL_CONFIG_DIR"; log_dir="$LOG_DIR"; use_sudo=false
+        INSTALL_DIR="$LOCAL_INSTALL_DIR"
     elif [ -f "$global_location" ]; then
         location="$global_location"; config_dir="$GLOBAL_CONFIG_DIR"; log_dir="$GLOBAL_LOG_DIR"; use_sudo=true
+        INSTALL_DIR="$GLOBAL_INSTALL_DIR"
     else
         echo "No installation found. Nothing to uninstall."
         exit 1
@@ -156,7 +193,7 @@ uninstall() {
                 exit 1
             fi
         fi
-        sudo rm -f "$location"
+        sudo rm -rf "$INSTALL_DIR/$SCRIPT_NAME"
         sudo rm -rf "$config_dir"
         sudo rm -rf "$log_dir"
     else
@@ -241,7 +278,7 @@ fi
 
     # Parse command-line options
     case "$1" in
-        --uninstall)
+        --remove|--uninstall)
             uninstall
             ;;
         -h|--help)
@@ -352,15 +389,15 @@ clone_repository
 
 # Create the installation directory if it does not exist
 if [ ! -d "$INSTALL_DIR" ]; then
-    mkdir -p "$INSTALL_DIR"
+    mkdir -p $INSTALL_DIR
     if [ "$USE_SUDO" = true ]; then
-        chown root:root "$INSTALL_DIR/$SCRIPT_NAME"
-        chmod 755 "$INSTALL_DIR/$SCRIPT_NAME"
+        chown root:root $INSTALL_DIR/$SCRIPT_NAME
+        chmod 755 $INSTALL_DIR/$SCRIPT_NAME
     else 
         # Add ~/bin to PATH if installing locally and ~/bin is not in PATH
             if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
-                echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc"
-                source "$HOME/.bashrc"
+                echo 'export PATH="$HOME/bin:$PATH"' >> $HOME/.bashrc
+                source $HOME/.bashrc
                 log_message "Added $HOME/bin to PATH."
             fi
     fi
@@ -368,28 +405,16 @@ if [ ! -d "$INSTALL_DIR" ]; then
 fi
 
 # Move the scripts to the installation directory
-if [ "$USE_SUDO" = true ]; then
-    if ! mv "$TEMP_DIR/*" "$INSTALL_DIR/$SCRIPT_NAME/"; then
-        log_message "Error moving scripts to $INSTALL_DIR. Aborting installation."
-        cleanup
-        exit 1
-    fi
-else
-    if ! mv "$TEMP_DIR/*" "$INSTALL_DIR/$SCRIPT_NAME/"; then
-        log_message "Error moving scripts to $INSTALL_DIR. Aborting installation."
-        cleanup
-        exit 1
-    fi
-fi
+
 
 # Create the configuration directory if it does not exist
 if [ ! -d "$CONFIG_DIR" ]; then
     if [ "$USE_SUDO" = true ]; then
-        mkdir -p "$CONFIG_DIR"
-        chown "root:root" "$CONFIG_DIR"
-        chmod 666 "$CONFIG_DIR"
+        mkdir -p $CONFIG_DIR
+        chown root:root $CONFIG_DIR
+        chmod 666 $CONFIG_DIR
     else
-        mkdir -p "$CONFIG_DIR"
+        mkdir -p $CONFIG_DIR
     fi
     log_message "Configuration directory created at $CONFIG_DIR."
 fi
@@ -397,3 +422,4 @@ fi
 
 log_message "Installation complete. You can now run the script using the command '${SCRIPT_NAME}'."
 echo "Installation complete. You can now run the script using the command '${SCRIPT_NAME}'."
+echo "You can remove the script using the command 'uninstall_${SCRIPT_NAME}'."
